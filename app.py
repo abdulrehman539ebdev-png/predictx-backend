@@ -1,12 +1,15 @@
 ﻿"""
-PredictX Flask API â€” Fixed Column Names
+PredictX Flask API - Fixed Column Names + Supabase Upload
 """
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import os
+import base64
+import io
+from supabase import create_client
 
 app = Flask(__name__)
 CORS(app)
@@ -14,7 +17,12 @@ CORS(app)
 EXCEL_PATH = 'data/Pakistan_ML_Results.xlsx'
 MODELS_DIR = 'models'
 
-# â”€â”€ Cache â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Supabase setup
+SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
+SUPABASE_KEY = os.environ.get('SUPABASE_KEY', '')
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+
+# Cache
 _cache = {}
 
 def load_sheet(sheet_name):
@@ -24,21 +32,94 @@ def load_sheet(sheet_name):
             df = df.where(pd.notnull(df), None)
             _cache[sheet_name] = df
         except Exception as e:
-            print(f"âŒ Sheet load failed [{sheet_name}]: {e}")
+            print(f"Sheet load failed [{sheet_name}]: {e}")
             _cache[sheet_name] = pd.DataFrame()
     return _cache[sheet_name]
 
-# â”€â”€ Health â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Health
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
         'status' : 'ok',
         'excel'  : os.path.exists(EXCEL_PATH),
         'models' : os.path.exists(MODELS_DIR),
-        'message': 'PredictX API is Working! âœ…'
+        'supabase': supabase is not None,
+        'message': 'PredictX API is Working!'
     })
 
-# â”€â”€ Dashboard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Upload
+@app.route('/api/upload', methods=['POST'])
+def upload_data():
+    try:
+        if not supabase:
+            return jsonify({'error': 'Supabase not configured'}), 500
+
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data received'}), 400
+
+        filename = data.get('filename', '')
+        file_data = data.get('data', '')
+
+        if not file_data:
+            return jsonify({'error': 'No file data'}), 400
+
+        # Base64 decode
+        file_bytes = base64.b64decode(file_data)
+
+        # CSV ya Excel read karo
+        if filename.lower().endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(file_bytes))
+        else:
+            df = pd.read_excel(io.BytesIO(file_bytes))
+
+        # Column names normalize
+        df.columns = [c.strip() for c in df.columns]
+
+        print(f"Uploaded file columns: {list(df.columns)}")
+        print(f"Total rows: {len(df)}")
+
+        # Required columns check
+        required = ['Date', 'Product_Name', 'Category', 'Quantity_Sold', 'Unit_Price_PKR']
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            return jsonify({'error': f'Missing columns: {missing}. Found: {list(df.columns)}'}), 400
+
+        # Supabase mein insert
+        rows = []
+        for _, row in df.iterrows():
+            try:
+                rows.append({
+                    'date'          : str(row.get('Date', '')),
+                    'product_name'  : str(row.get('Product_Name', '')),
+                    'category'      : str(row.get('Category', '')),
+                    'quantity_sold' : int(row.get('Quantity_Sold', 0) or 0),
+                    'unit_price_pkr': float(row.get('Unit_Price_PKR', 0) or 0),
+                    'is_holiday'    : int(row.get('Is_Holiday', 0) or 0),
+                    'is_ramadan'    : int(row.get('Is_Ramadan', 0) or 0),
+                })
+            except Exception as row_err:
+                print(f"Row error: {row_err}")
+                continue
+
+        if rows:
+            # Batch insert - 500 rows at a time
+            batch_size = 500
+            for i in range(0, len(rows), batch_size):
+                batch = rows[i:i + batch_size]
+                supabase.table('sales_data').insert(batch).execute()
+
+        return jsonify({
+            'message': f'{len(rows)} rows uploaded successfully!',
+            'rows'   : len(rows),
+            'status' : 'success'
+        })
+
+    except Exception as e:
+        print(f"Upload error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# Dashboard
 @app.route('/api/dashboard', methods=['GET'])
 def dashboard():
     try:
@@ -53,7 +134,7 @@ def dashboard():
         if not inv_df.empty:
             low_stock = int(inv_df[
                 inv_df['Status'].astype(str).str.contains(
-                    'LOW|Order Now|ðŸ”´', na=False)
+                    'LOW|Order Now', na=False)
             ].shape[0])
 
         top_products = []
@@ -77,7 +158,7 @@ def dashboard():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# â”€â”€ Model Accuracy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Model Accuracy
 @app.route('/api/model-accuracy', methods=['GET'])
 def model_accuracy():
     try:
@@ -100,7 +181,7 @@ def model_accuracy():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# â”€â”€ Ramadan Spike â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ramadan Spike
 @app.route('/api/ramadan-spike', methods=['GET'])
 def ramadan_spike():
     try:
@@ -123,7 +204,7 @@ def ramadan_spike():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# â”€â”€ Profit Analysis â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Profit Analysis
 @app.route('/api/profit-analysis', methods=['GET'])
 def profit_analysis():
     try:
@@ -148,7 +229,7 @@ def profit_analysis():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# â”€â”€ Inventory Status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Inventory Status
 @app.route('/api/inventory-status', methods=['GET'])
 def inventory_status():
     try:
@@ -158,9 +239,9 @@ def inventory_status():
 
         def clean_status(s):
             s = str(s)
-            if any(x in s for x in ['ðŸ”´', 'LOW', 'Order Now']):
+            if any(x in s for x in ['LOW', 'Order Now']):
                 return 'Low'
-            elif any(x in s for x in ['ðŸ”µ', 'OVER', 'Stop']):
+            elif any(x in s for x in ['OVER', 'Stop']):
                 return 'Overstock'
             return 'Normal'
 
@@ -201,7 +282,7 @@ def inventory_status():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# â”€â”€ Forecast â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Forecast
 @app.route('/api/forecast', methods=['GET'])
 def forecast():
     try:
@@ -209,18 +290,14 @@ def forecast():
         if df.empty:
             return jsonify({'data': []})
 
-        # Debug â€” terminal mein actual columns dikhao
-        print(f"ðŸ“Š 30Day_Forecast columns : {list(df.columns)}")
-        print(f"ðŸ“Š Total rows             : {len(df)}")
-        if not df.empty:
-            print(f"ðŸ“Š Sample row             : {df.iloc[0].to_dict()}")
+        print(f"30Day_Forecast columns: {list(df.columns)}")
+        print(f"Total rows: {len(df)}")
 
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
 
         result = []
         for _, row in df.iterrows():
-            # âœ… ARIMAX_Forecast column pehle check â€” tab Forecasted_Qty
             qty = (row.get('ARIMAX_Forecast') or
                    row.get('Forecasted_Qty')  or
                    row.get('forecasted_qty')  or
@@ -234,36 +311,50 @@ def forecast():
                 'Product'        : str(product),
                 'ARIMAX_Forecast': int(float(qty)),
                 'Forecasted_Qty' : int(float(qty)),
-                'Day_Type'       : str(row.get('Day_Type', 'ðŸ“… Normal')),
+                'Day_Type'       : str(row.get('Day_Type', 'Normal')),
                 'Is_Ramadan'     : int(row.get('Is_Ramadan', 0) or 0),
                 'Is_Holiday'     : int(row.get('Is_Holiday', 0) or 0),
             })
 
-        print(f"âœ… Forecast rows returned : {len(result)}")
+        print(f"Forecast rows returned: {len(result)}")
         return jsonify({'data': result})
 
     except Exception as e:
-        print(f"âŒ Forecast error: {e}")
+        print(f"Forecast error: {e}")
         return jsonify({'error': str(e)}), 500
 
-# â”€â”€ Run â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Uploaded Sales Data
+@app.route('/api/sales-data', methods=['GET'])
+def get_sales_data():
+    try:
+        if not supabase:
+            return jsonify({'error': 'Supabase not configured'}), 500
+
+        response = supabase.table('sales_data').select('*').order('date', desc=True).limit(1000).execute()
+        return jsonify(response.data)
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# Run
 if __name__ == '__main__':
     print("=" * 55)
     print("  PredictX Flask API Starting...")
     print("=" * 55)
-    print(f"  Excel : {EXCEL_PATH} â€” {'âœ… Found' if os.path.exists(EXCEL_PATH) else 'âŒ NOT FOUND'}")
-    print(f"  Models: {MODELS_DIR}/  â€” {'âœ… Found' if os.path.exists(MODELS_DIR) else 'âŒ NOT FOUND'}")
+    print(f"  Excel  : {EXCEL_PATH} - {'Found' if os.path.exists(EXCEL_PATH) else 'NOT FOUND'}")
+    print(f"  Models : {MODELS_DIR}/ - {'Found' if os.path.exists(MODELS_DIR) else 'NOT FOUND'}")
+    print(f"  Supabase: {'Connected' if supabase else 'NOT configured'}")
     print()
     print("  Endpoints:")
-    print("  GET /health")
-    print("  GET /api/dashboard")
-    print("  GET /api/model-accuracy")
-    print("  GET /api/ramadan-spike")
-    print("  GET /api/profit-analysis")
-    print("  GET /api/inventory-status")
-    print("  GET /api/forecast")
-    print()
-    print("  Flutter real device: http://10.71.37.36:5000")
+    print("  GET  /health")
+    print("  POST /api/upload")
+    print("  GET  /api/dashboard")
+    print("  GET  /api/model-accuracy")
+    print("  GET  /api/ramadan-spike")
+    print("  GET  /api/profit-analysis")
+    print("  GET  /api/inventory-status")
+    print("  GET  /api/forecast")
+    print("  GET  /api/sales-data")
     print("=" * 55)
 
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)
